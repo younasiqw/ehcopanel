@@ -34,15 +34,21 @@ python3 -m venv "$APP_DIR/venv"
 # 2. 设置密码与端口
 # ==========================================
 echo -e "------------------------------------------------"
-read -p "请设置网页管理端的登录密码: " WEB_PASSWORD
-read -p "请设置网页运行端口 (默认 5000): " WEB_PORT
-WEB_PORT=${WEB_PORT:-5000}
-
-# 保存密码哈希 (这里为了简化不使用复杂加盐，但实际逻辑中会比对)
-echo "$WEB_PASSWORD" > "$APP_DIR/password.txt"
+# 检查是否已存在密码文件，如果存在则跳过设置，避免覆盖
+if [ -f "$APP_DIR/password.txt" ]; then
+    echo -e "${GREEN}检测到已存在密码配置，保留原密码。${PLAIN}"
+    # 读取旧端口配置有点麻烦，这里简单处理：让用户确认或重新输入
+    read -p "请输入网页运行端口 (默认 5000): " WEB_PORT
+    WEB_PORT=${WEB_PORT:-5000}
+else
+    read -p "请设置网页管理端的登录密码: " WEB_PASSWORD
+    read -p "请设置网页运行端口 (默认 5000): " WEB_PORT
+    WEB_PORT=${WEB_PORT:-5000}
+    echo "$WEB_PASSWORD" > "$APP_DIR/password.txt"
+fi
 
 # ==========================================
-# 3. 生成后端代码 (app.py)
+# 3. 生成后端代码 (app.py) - 已修复下载链接
 # ==========================================
 cat > "$APP_DIR/app.py" <<EOF
 import os
@@ -113,7 +119,7 @@ def get_status():
         "config": config_data
     })
 
-# API: 安装 Ehco
+# API: 安装 Ehco (修复版)
 @app.route('/api/install', methods=['POST'])
 def install_ehco():
     if not check_auth(): return jsonify({"error": "Unauthorized"}), 401
@@ -126,18 +132,35 @@ def install_ehco():
     else:
         return jsonify({"success": False, "message": f"不支持的架构: {arch}"})
 
-    url = f"https://github.com/Ehco/Ehco/releases/download/v{EHCO_VERSION}/ehco_{EHCO_VERSION}_linux_{arch_tag}"
+    # === 修复点：使用正确的 GitHub 仓库和文件名格式，并增加镜像加速 ===
+    # 原链接: https://github.com/Ehco1996/ehco/releases/download/v1.1.4/ehco_linux_amd64
+    # 镜像链接: https://mirror.ghproxy.com/https://github.com/...
+    
+    base_url = "https://github.com/Ehco1996/ehco/releases/download"
+    filename = f"ehco_linux_{arch_tag}"
+    
+    # 优先尝试镜像下载
+    mirror_url = f"https://mirror.ghproxy.com/{base_url}/v{EHCO_VERSION}/{filename}"
     
     try:
-        subprocess.run(["wget", "-O", EHCO_BIN, url], check=True)
+        print(f"Trying to download from: {mirror_url}")
+        subprocess.run(["wget", "-O", EHCO_BIN, mirror_url], check=True)
+    except subprocess.CalledProcessError:
+        # 如果镜像失败，尝试官方源
+        try:
+            origin_url = f"{base_url}/v{EHCO_VERSION}/{filename}"
+            print(f"Mirror failed, trying original: {origin_url}")
+            subprocess.run(["wget", "-O", EHCO_BIN, origin_url], check=True)
+        except subprocess.CalledProcessError as e:
+            return jsonify({"success": False, "message": "下载失败，请检查网络或手动上传文件"})
+
+    try:
         subprocess.run(["chmod", "+x", EHCO_BIN], check=True)
         
-        # 创建 Config
         if not os.path.exists(EHCO_CONFIG):
             with open(EHCO_CONFIG, 'w') as f:
                 json.dump([], f)
 
-        # 创建 Service
         service_content = f"""[Unit]
 Description=Ehco Service
 After=network.target
@@ -171,9 +194,6 @@ def uninstall_ehco():
     if os.path.exists(SERVICE_FILE): os.remove(SERVICE_FILE)
     subprocess.run(["systemctl", "daemon-reload"])
     if os.path.exists(EHCO_BIN): os.remove(EHCO_BIN)
-    # 保留配置文件夹，或根据需求删除
-    # import shutil
-    # shutil.rmtree("/etc/ehco", ignore_errors=True)
     return jsonify({"success": True})
 
 # API: 重启 Ehco
@@ -197,7 +217,6 @@ def add_rule():
     if not check_auth(): return jsonify({"error": "Unauthorized"}), 401
     data = request.json
     
-    # 读取现有配置
     current_config = []
     if os.path.exists(EHCO_CONFIG):
         with open(EHCO_CONFIG, 'r') as f:
@@ -206,7 +225,6 @@ def add_rule():
             except:
                 pass
     
-    # data 结构由前端构建，是一个列表，可能包含 1 个或 2 个规则(tcp+udp)
     rules_to_add = data.get('rules', [])
     for r in rules_to_add:
         current_config.append(r)
@@ -256,7 +274,7 @@ cat > "$APP_DIR/templates/login.html" <<EOF
 EOF
 
 # ==========================================
-# 5. 生成前端模板 (index.html) - 核心 UI
+# 5. 生成前端模板 (index.html)
 # ==========================================
 cat > "$APP_DIR/templates/index.html" <<EOF
 <!DOCTYPE html>
@@ -403,7 +421,6 @@ cat > "$APP_DIR/templates/index.html" <<EOF
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-    // 页面加载时刷新状态
     document.addEventListener('DOMContentLoaded', refreshStatus);
 
     async function refreshStatus() {
@@ -411,7 +428,6 @@ cat > "$APP_DIR/templates/index.html" <<EOF
         if (res.status === 401) window.location.reload();
         const data = await res.json();
         
-        // 更新安装/运行状态
         const installBadge = document.getElementById('installStatus');
         const runBadge = document.getElementById('runStatus');
         const btns = document.getElementById('actionButtons');
@@ -427,7 +443,6 @@ cat > "$APP_DIR/templates/index.html" <<EOF
             runBadge.style.display = 'none';
         }
 
-        // 渲染配置表格
         const tbody = document.getElementById('configTableBody');
         tbody.innerHTML = '';
         if (data.config && data.config.length > 0) {
@@ -482,11 +497,9 @@ cat > "$APP_DIR/templates/index.html" <<EOF
         const tport = formData.get('tport');
 
         if (mode === 1) {
-            // 不加密：TCP + UDP
             rules.push({listen: ':'+lport, listen_type: 'tcp', remote: tip+':'+tport, remote_type: 'tcp'});
             rules.push({listen: ':'+lport, listen_type: 'udp', remote: tip+':'+tport, remote_type: 'udp'});
         } else if (mode === 2) {
-            // 加密发送
             const proto = formData.get('proto');
             const udpEnable = formData.get('udp_enable') === 'on';
             rules.push({listen: ':'+lport, listen_type: 'tcp', remote: tip+':'+tport, remote_type: proto});
@@ -494,7 +507,6 @@ cat > "$APP_DIR/templates/index.html" <<EOF
                 rules.push({listen: ':'+lport, listen_type: 'udp', remote: tip+':'+tport, remote_type: proto});
             }
         } else if (mode === 3) {
-            // 解密接收
             const proto = formData.get('proto');
             const targetProto = formData.get('target_proto');
             rules.push({listen: ':'+lport, listen_type: proto, remote: tip+':'+tport, remote_type: targetProto});

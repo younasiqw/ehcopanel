@@ -37,7 +37,6 @@ echo -e "------------------------------------------------"
 # 检查是否已存在密码文件，如果存在则跳过设置，避免覆盖
 if [ -f "$APP_DIR/password.txt" ]; then
     echo -e "${GREEN}检测到已存在密码配置，保留原密码。${PLAIN}"
-    # 读取旧端口配置有点麻烦，这里简单处理：让用户确认或重新输入
     read -p "请输入网页运行端口 (默认 5000): " WEB_PORT
     WEB_PORT=${WEB_PORT:-5000}
 else
@@ -48,7 +47,7 @@ else
 fi
 
 # ==========================================
-# 3. 生成后端代码 (app.py) - 已修复下载链接
+# 3. 生成后端代码 (app.py) - 核心修复
 # ==========================================
 cat > "$APP_DIR/app.py" <<EOF
 import os
@@ -93,7 +92,7 @@ def index():
     if not check_auth(): return redirect(url_for('login'))
     return render_template('index.html')
 
-# API: 获取状态
+# API: 获取状态 (已修复读取逻辑)
 @app.route('/api/status')
 def get_status():
     if not check_auth(): return jsonify({"error": "Unauthorized"}), 401
@@ -109,7 +108,12 @@ def get_status():
     if os.path.exists(EHCO_CONFIG):
         try:
             with open(EHCO_CONFIG, 'r') as f:
-                config_data = json.load(f)
+                raw = json.load(f)
+                # === 修复: 兼容旧版数组和新版对象 ===
+                if isinstance(raw, list):
+                    config_data = raw
+                else:
+                    config_data = raw.get('relay_rules', [])
         except:
             pass
 
@@ -119,7 +123,7 @@ def get_status():
         "config": config_data
     })
 
-# API: 安装 Ehco (修复版)
+# API: 安装 Ehco
 @app.route('/api/install', methods=['POST'])
 def install_ehco():
     if not check_auth(): return jsonify({"error": "Unauthorized"}), 401
@@ -132,10 +136,6 @@ def install_ehco():
     else:
         return jsonify({"success": False, "message": f"不支持的架构: {arch}"})
 
-    # === 修复点：使用正确的 GitHub 仓库和文件名格式，并增加镜像加速 ===
-    # 原链接: https://github.com/Ehco1996/ehco/releases/download/v1.1.4/ehco_linux_amd64
-    # 镜像链接: https://mirror.ghproxy.com/https://github.com/...
-    
     base_url = "https://github.com/Ehco1996/ehco/releases/download"
     filename = f"ehco_linux_{arch_tag}"
     
@@ -157,9 +157,10 @@ def install_ehco():
     try:
         subprocess.run(["chmod", "+x", EHCO_BIN], check=True)
         
+        # === 修复: 初始化为对象结构 ===
         if not os.path.exists(EHCO_CONFIG):
             with open(EHCO_CONFIG, 'w') as f:
-                json.dump([], f)
+                json.dump({"relay_rules": []}, f)
 
         service_content = f"""[Unit]
 Description=Ehco Service
@@ -207,8 +208,9 @@ def restart_ehco():
 @app.route('/api/init_config', methods=['POST'])
 def init_config():
     if not check_auth(): return jsonify({"error": "Unauthorized"}), 401
+    # === 修复: 初始化为对象结构 ===
     with open(EHCO_CONFIG, 'w') as f:
-        json.dump([], f)
+        json.dump({"relay_rules": []}, f)
     return jsonify({"success": True})
 
 # API: 添加规则
@@ -217,17 +219,27 @@ def add_rule():
     if not check_auth(): return jsonify({"error": "Unauthorized"}), 401
     data = request.json
     
-    current_config = []
+    # 默认基本结构
+    current_config = {"relay_rules": []}
+    
     if os.path.exists(EHCO_CONFIG):
         with open(EHCO_CONFIG, 'r') as f:
             try:
-                current_config = json.load(f)
+                raw = json.load(f)
+                # === 修复: 自动处理数组转对象 ===
+                if isinstance(raw, list):
+                    current_config["relay_rules"] = raw
+                else:
+                    current_config = raw
             except:
                 pass
     
     rules_to_add = data.get('rules', [])
     for r in rules_to_add:
-        current_config.append(r)
+        # 确保 relay_rules 键存在
+        if "relay_rules" not in current_config:
+            current_config["relay_rules"] = []
+        current_config["relay_rules"].append(r)
         
     with open(EHCO_CONFIG, 'w') as f:
         json.dump(current_config, f, indent=4)
@@ -554,7 +566,17 @@ systemctl enable ehco-web
 systemctl restart ehco-web
 
 # ==========================================
-# 7. 完成提示
+# 7. 强制修复现有配置 (Critical Fix)
+# ==========================================
+if [ -f "/etc/ehco/config.json" ]; then
+    echo -e "${YELLOW}正在强制重置配置文件格式...${PLAIN}"
+    # 强制覆盖为正确的对象格式，避免旧的数组格式残留
+    echo '{"relay_rules": []}' > /etc/ehco/config.json
+    systemctl restart ehco
+fi
+
+# ==========================================
+# 8. 完成提示
 # ==========================================
 IP=$(curl -s4 ifconfig.me)
 echo -e "${GREEN}==========================================${PLAIN}"

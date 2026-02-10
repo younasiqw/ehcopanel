@@ -61,10 +61,8 @@ DATA_DIR = "$APP_DIR/data"
 SERVERS_FILE = os.path.join(DATA_DIR, "servers.json")
 PASSWORD_FILE = os.path.join(DATA_DIR, "password.txt")
 
-# Ehco 版本信息
-EHCO_VER = "1.1.4"
-# 镜像加速
-DOWNLOAD_URL_BASE = "https://mirror.ghproxy.com/https://github.com/Ehco1996/ehco/releases/download/v1.1.4"
+# Ehco 版本定义
+EHCO_TAG = "v1.1.4"
 
 def get_ssh_client(ip, port, user, password):
     client = paramiko.SSHClient()
@@ -109,13 +107,11 @@ def logout():
 def root():
     return redirect(url_for('dashboard'))
 
-# 1. 仪表盘：服务器列表
 @app.route('/dashboard')
 def dashboard():
     if not session.get('logged_in'): return redirect(url_for('login'))
     return render_template('dashboard.html')
 
-# 2. 单机管理页
 @app.route('/manage/<int:server_id>')
 def manage(server_id):
     if not session.get('logged_in'): return redirect(url_for('login'))
@@ -123,7 +119,6 @@ def manage(server_id):
 
 # ================= APIs =================
 
-# API: 获取服务器列表
 @app.route('/api/servers', methods=['GET'])
 def list_servers():
     if not session.get('logged_in'): return jsonify({'error': '401'}), 401
@@ -140,7 +135,6 @@ def list_servers():
             
     return jsonify(servers)
 
-# API: 添加服务器
 @app.route('/api/servers/add', methods=['POST'])
 def add_server():
     if not session.get('logged_in'): return jsonify({'error': '401'}), 401
@@ -161,7 +155,6 @@ def add_server():
         json.dump(servers, f, indent=4)
     return jsonify({'success': True})
 
-# API: 删除服务器
 @app.route('/api/servers/delete/<int:sid>', methods=['POST'])
 def delete_server(sid):
     if not session.get('logged_in'): return jsonify({'error': '401'}), 401
@@ -187,7 +180,7 @@ def remote_status(sid):
     server = get_server_by_id(sid)
     if not server: return jsonify({'error': 'Not found'}), 404
 
-    # 1. 检查是否安装
+    # 检查是否安装
     check_cmd = "test -f /usr/local/bin/ehco && echo 'yes' || echo 'no'"
     out, err = run_remote_command(server, check_cmd)
     if err: return jsonify({'success': False, 'message': f"连接失败: {err}"})
@@ -197,12 +190,12 @@ def remote_status(sid):
     config_data = []
 
     if is_installed:
-        # 2. 检查运行状态 (兼容 active 和 activating)
+        # 检查运行状态 (兼容 active 和 activating)
         run_cmd = "systemctl is-active ehco"
         out_run, _ = run_remote_command(server, run_cmd)
         is_running = (out_run == 'active' or out_run == 'activating')
 
-        # 3. 读取配置
+        # 读取配置
         cat_cmd = "cat /etc/ehco/config.json"
         out_conf, _ = run_remote_command(server, cat_cmd)
         try:
@@ -229,27 +222,32 @@ def remote_install(sid):
     
     # 1. 检测架构
     arch_out, _ = run_remote_command(server, "uname -m")
-    if arch_out == 'x86_64': filename = "ehco_linux_amd64"
-    elif arch_out == 'aarch64': filename = "ehco_linux_arm64"
-    else: return jsonify({'success': False, 'message': '不支持的架构'})
+    if arch_out == 'x86_64': 
+        filename = "ehco_linux_amd64"
+    elif arch_out == 'aarch64': 
+        filename = "ehco_linux_arm64"
+    else: 
+        return jsonify({'success': False, 'message': f'不支持的架构: {arch_out}'})
 
-    download_url = f"{DOWNLOAD_URL_BASE}/{filename}"
+    # 官方源和镜像源
+    official_url = f"https://github.com/Ehco1996/ehco/releases/download/{EHCO_TAG}/{filename}"
+    mirror_url = f"https://mirror.ghproxy.com/{official_url}"
     
-    # 2. 组合安装命令
-    # 【Systemd 兼容性修复】：移除了不兼容旧版的 StartLimitIntervalSec，只保留 Restart=always
+    # 2. 组合安装命令 (双保险下载 + 文件校验 + 服务保活)
+    # 【v7修复】：移除了StartLimitIntervalSec，强制使用 echo 写入标准 JSON
     install_script = f"""
     apt update && apt install -y wget jq ca-certificates
     
-    # 清理旧文件
+    # 停止旧服务
     systemctl stop ehco 2>/dev/null
     rm -f /usr/local/bin/ehco
 
     echo "Downloading from Mirror..."
-    wget -T 15 -t 2 -O /usr/local/bin/ehco https://mirror.ghproxy.com/https://github.com/Ehco1996/ehco/releases/download/v1.1.4/{filename}
+    wget -T 15 -t 2 -O /usr/local/bin/ehco {mirror_url}
     
     if [ ! -s /usr/local/bin/ehco ]; then
         echo "Mirror failed, trying Official..."
-        wget -T 30 -t 3 -O /usr/local/bin/ehco https://github.com/Ehco1996/ehco/releases/download/v1.1.4/{filename}
+        wget -T 30 -t 3 -O /usr/local/bin/ehco {official_url}
     fi
 
     if [ ! -s /usr/local/bin/ehco ]; then
@@ -259,7 +257,7 @@ def remote_install(sid):
     
     chmod +x /usr/local/bin/ehco
     
-    # 验证文件
+    # 验证文件是否损坏
     if ! /usr/local/bin/ehco -h > /dev/null 2>&1; then
         echo "FATAL: Downloaded file is corrupted (HTML or Wrong Arch)."
         rm -f /usr/local/bin/ehco
@@ -267,13 +265,13 @@ def remote_install(sid):
     fi
     
     mkdir -p /etc/ehco
+    # 【重点修复】初始化一个必须有效的空规则文件，防止 Ehco 认为配置错误直接退出
     echo '{{"relay_rules": []}}' > /etc/ehco/config.json
     
-    # === 兼容性修复的 Systemd 配置 ===
+    # 【重点修复】移除不兼容参数，保留 Restart=always
     echo '[Unit]
 Description=Ehco Service
-After=network.target network-online.target
-Wants=network-online.target
+After=network.target
 
 [Service]
 Type=simple
@@ -293,7 +291,7 @@ WantedBy=multi-user.target' > /etc/systemd/system/ehco.service
     out, err = run_remote_command(server, install_script)
     
     if "FATAL" in out:
-         return jsonify({'success': False, 'message': f"安装失败: {out}"})
+         return jsonify({'success': False, 'message': f"安装失败: 文件损坏或下载失败。请检查被控机网络。{out}"})
          
     if "error" in err.lower() and "apt" not in err.lower(): 
          return jsonify({'success': False, 'message': err})
@@ -313,9 +311,11 @@ def remote_save_rules(sid):
     server = get_server_by_id(sid)
     data = request.json 
     
+    # 确保写入的是包含 relay_rules 的对象结构
     new_config = {"relay_rules": data.get('rules', [])}
     json_str = json.dumps(new_config, indent=4)
     
+    # 写入配置并重启 (使用 echo 防止 EOF 冲突)
     json_str_safe = json_str.replace("'", "'\"'\"'")
     cmd = f"echo '{json_str_safe}' > /etc/ehco/config.json && systemctl restart ehco"
     
@@ -632,8 +632,10 @@ cat > "$APP_DIR/templates/manage.html" <<EOF
         if(data.installed) {
             document.getElementById('installStatus').className = 'badge bg-success';
             document.getElementById('installStatus').innerText = '已安装';
-            document.getElementById('runStatus').innerText = data.running ? '运行中' : '已停止';
-            document.getElementById('runStatus').className = data.running ? 'badge bg-success' : 'badge bg-danger';
+            // 兼容 activating 状态 (服务保活重启中)
+            const isRunning = data.running; 
+            document.getElementById('runStatus').innerText = isRunning ? '运行中' : '已停止';
+            document.getElementById('runStatus').className = isRunning ? 'badge bg-success' : 'badge bg-danger';
             document.getElementById('controlBtns').style.display = 'block';
             document.getElementById('actionBtns').style.display = 'none';
         } else {

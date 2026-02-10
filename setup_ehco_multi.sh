@@ -45,7 +45,7 @@ else
 fi
 
 # ==========================================
-# 生成后端 (app.py) - 修复了 EOF 嵌套问题
+# 生成后端 (app.py)
 # ==========================================
 cat > "$APP_DIR/app.py" <<EOF
 import os
@@ -201,7 +201,7 @@ def remote_status(sid):
         # 2. 检查运行状态
         run_cmd = "systemctl is-active ehco"
         out_run, _ = run_remote_command(server, run_cmd)
-        is_running = (out_run == 'active')
+        is_running = (out_run == 'active' or out_run == 'activating')
 
         # 3. 读取配置
         cat_cmd = "cat /etc/ehco/config.json"
@@ -237,9 +237,10 @@ def remote_install(sid):
     download_url = f"{DOWNLOAD_URL_BASE}/{filename}"
     
     # 2. 组合安装命令 (远程执行)
-    # 【修复重点】改用 echo 写入文件，彻底避免嵌套 Heredoc 导致的 Bash 错误
+    # 【修复重点】1. 使用 echo 写入文件避免嵌套 EOF 问题。
+    # 【修复重点】2. Systemd 增加 Restart=always 和 RestartSec 保活，防止空配置导致服务停止。
     install_script = f"""
-    apt update && apt install -y wget jq
+    apt update && apt install -y wget jq ca-certificates
     wget -O /usr/local/bin/ehco {download_url}
     chmod +x /usr/local/bin/ehco
     mkdir -p /etc/ehco
@@ -247,18 +248,23 @@ def remote_install(sid):
     
     echo '[Unit]
 Description=Ehco Service
-After=network.target
+After=network.target network-online.target
+Wants=network-online.target
+
 [Service]
 Type=simple
 User=root
 ExecStart=/usr/local/bin/ehco -c /etc/ehco/config.json
-Restart=on-failure
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
 [Install]
 WantedBy=multi-user.target' > /etc/systemd/system/ehco.service
 
     systemctl daemon-reload
     systemctl enable ehco
-    systemctl start ehco
+    systemctl restart ehco
     """
     
     out, err = run_remote_command(server, install_script)
@@ -514,10 +520,11 @@ cat > "$APP_DIR/templates/manage.html" <<EOF
                             <div class="col-md-3"><label>目标 IP</label><input type="text" name="tip" class="form-control" required></div>
                             <div class="col-md-3"><label>目标端口</label><input type="number" name="tport" class="form-control" required></div>
                             <div class="col-md-3">
-                                <div class="form-check border p-2 rounded bg-white">
-                                    <input class="form-check-input" type="checkbox" name="udp_enable" id="udp1">
-                                    <label class="form-check-label text-danger fw-bold" for="udp1">同时添加 UDP 规则</label>
-                                </div>
+                                <label>转发类型</label>
+                                <select name="forward_type" class="form-select">
+                                    <option value="tcp">TCP (默认)</option>
+                                    <option value="both">TCP + UDP</option>
+                                </select>
                             </div>
                         </div>
                         <button class="btn btn-primary mt-3">添加规则</button>
@@ -537,10 +544,11 @@ cat > "$APP_DIR/templates/manage.html" <<EOF
                             <div class="col-md-3"><label>落地 IP</label><input type="text" name="tip" class="form-control" required></div>
                             <div class="col-md-3"><label>落地端口</label><input type="number" name="tport" class="form-control" required></div>
                             <div class="col-md-3">
-                                <div class="form-check border p-2 rounded bg-white">
-                                    <input class="form-check-input" type="checkbox" name="udp_enable" id="udp2">
-                                    <label class="form-check-label text-danger fw-bold" for="udp2">同时添加 UDP 规则</label>
-                                </div>
+                                <label>转发类型</label>
+                                <select name="forward_type" class="form-select">
+                                    <option value="tcp">TCP (默认)</option>
+                                    <option value="both">TCP + UDP</option>
+                                </select>
                             </div>
                         </div>
                         <button class="btn btn-primary mt-3">添加规则</button>
@@ -665,19 +673,25 @@ cat > "$APP_DIR/templates/manage.html" <<EOF
         const lport = fd.get('lport');
         const tip = fd.get('tip');
         const tport = fd.get('tport');
-        const udpEnabled = fd.get('udp_enable') === 'on';
+        const ftype = fd.get('forward_type'); // 新增: 获取转发类型
 
         let newEntries = [];
 
-        if (mode === 1) { // 不加密
-            newEntries.push({listen: ':'+lport, listen_type: 'tcp', remote: tip+':'+tport, remote_type: 'tcp'});
-            if (udpEnabled) {
+        if (mode === 1) { // 不加密转发
+            // 默认添加 TCP
+            if (ftype === 'tcp' || ftype === 'both') {
+                newEntries.push({listen: ':'+lport, listen_type: 'tcp', remote: tip+':'+tport, remote_type: 'tcp'});
+            }
+            // 如果选择 Both，额外添加 UDP
+            if (ftype === 'both') {
                 newEntries.push({listen: ':'+lport, listen_type: 'udp', remote: tip+':'+tport, remote_type: 'udp'});
             }
         } else if (mode === 2) { // 加密发送
             const proto = fd.get('proto');
-            newEntries.push({listen: ':'+lport, listen_type: 'tcp', remote: tip+':'+tport, remote_type: proto});
-            if (udpEnabled) {
+            if (ftype === 'tcp' || ftype === 'both') {
+                newEntries.push({listen: ':'+lport, listen_type: 'tcp', remote: tip+':'+tport, remote_type: proto});
+            }
+            if (ftype === 'both') {
                 newEntries.push({listen: ':'+lport, listen_type: 'udp', remote: tip+':'+tport, remote_type: proto});
             }
         } else if (mode === 3) { // 解密接收

@@ -236,9 +236,7 @@ def remote_install(sid):
 
     download_url = f"{DOWNLOAD_URL_BASE}/{filename}"
     
-    # 2. 组合安装命令 (远程执行)
-    # 【修复重点】1. 使用 echo 写入文件避免嵌套 EOF 问题。
-    # 【修复重点】2. Systemd 增加 Restart=always 和 RestartSec 保活，防止空配置导致服务停止。
+    # 2. 组合安装命令
     install_script = f"""
     apt update && apt install -y wget jq ca-certificates
     wget -O /usr/local/bin/ehco {download_url}
@@ -496,8 +494,8 @@ cat > "$APP_DIR/templates/manage.html" <<EOF
         </div>
         <div class="card-body">
             <table class="table table-striped table-hover">
-                <thead><tr><th>监听</th><th>类型</th><th>转发至</th><th>目标类型</th></tr></thead>
-                <tbody id="rulesTable"><tr><td colspan="4">加载中...</td></tr></tbody>
+                <thead><tr><th>监听</th><th>类型</th><th>转发至</th><th>目标类型</th><th>操作</th></tr></thead>
+                <tbody id="rulesTable"><tr><td colspan="5">加载中...</td></tr></tbody>
             </table>
         </div>
     </div>
@@ -626,12 +624,24 @@ cat > "$APP_DIR/templates/manage.html" <<EOF
         const tbody = document.getElementById('rulesTable');
         tbody.innerHTML = '';
         if(rules.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted">暂无配置</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted">暂无配置</td></tr>';
             return;
         }
-        rules.forEach(r => {
-            tbody.innerHTML += \`<tr><td>\${r.listen}</td><td><span class="badge bg-light text-dark border">\${r.listen_type}</span></td><td>\${r.remote}</td><td><span class="badge bg-light text-dark border">\${r.remote_type}</span></td></tr>\`;
+        rules.forEach((r, index) => {
+            tbody.innerHTML += \`<tr>
+                <td>\${r.listen}</td>
+                <td><span class="badge bg-light text-dark border">\${r.listen_type}</span></td>
+                <td>\${r.remote}</td>
+                <td><span class="badge bg-light text-dark border">\${r.remote_type}</span></td>
+                <td><button onclick="deleteRule(\${index})" class="btn btn-sm btn-outline-danger">删除</button></td>
+            </tr>\`;
         });
+    }
+
+    async function deleteRule(index) {
+        if(!confirm('确认删除此规则?')) return;
+        currentConfig.splice(index, 1);
+        await saveRules(currentConfig);
     }
 
     async function installEhco() {
@@ -673,16 +683,14 @@ cat > "$APP_DIR/templates/manage.html" <<EOF
         const lport = fd.get('lport');
         const tip = fd.get('tip');
         const tport = fd.get('tport');
-        const ftype = fd.get('forward_type'); // 新增: 获取转发类型
+        const ftype = fd.get('forward_type'); 
 
         let newEntries = [];
 
         if (mode === 1) { // 不加密转发
-            // 默认添加 TCP
             if (ftype === 'tcp' || ftype === 'both') {
                 newEntries.push({listen: ':'+lport, listen_type: 'tcp', remote: tip+':'+tport, remote_type: 'tcp'});
             }
-            // 如果选择 Both，额外添加 UDP
             if (ftype === 'both') {
                 newEntries.push({listen: ':'+lport, listen_type: 'udp', remote: tip+':'+tport, remote_type: 'udp'});
             }
@@ -700,7 +708,6 @@ cat > "$APP_DIR/templates/manage.html" <<EOF
             newEntries.push({listen: ':'+lport, listen_type: proto, remote: tip+':'+tport, remote_type: tproto});
         }
 
-        // 追加到现有配置
         const finalRules = currentConfig.concat(newEntries);
         saveRules(finalRules);
         e.target.reset();

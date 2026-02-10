@@ -61,10 +61,8 @@ DATA_DIR = "$APP_DIR/data"
 SERVERS_FILE = os.path.join(DATA_DIR, "servers.json")
 PASSWORD_FILE = os.path.join(DATA_DIR, "password.txt")
 
-# Ehco 版本信息
-EHCO_VER = "1.1.4"
-# 镜像加速
-DOWNLOAD_URL_BASE = "https://mirror.ghproxy.com/https://github.com/Ehco1996/ehco/releases/download/v1.1.4"
+# Ehco 版本定义
+EHCO_TAG = "v1.1.4"
 
 def get_ssh_client(ip, port, user, password):
     client = paramiko.SSHClient()
@@ -109,13 +107,11 @@ def logout():
 def root():
     return redirect(url_for('dashboard'))
 
-# 1. 仪表盘：服务器列表
 @app.route('/dashboard')
 def dashboard():
     if not session.get('logged_in'): return redirect(url_for('login'))
     return render_template('dashboard.html')
 
-# 2. 单机管理页
 @app.route('/manage/<int:server_id>')
 def manage(server_id):
     if not session.get('logged_in'): return redirect(url_for('login'))
@@ -123,14 +119,12 @@ def manage(server_id):
 
 # ================= APIs =================
 
-# API: 获取服务器列表（含连通性检测）
 @app.route('/api/servers', methods=['GET'])
 def list_servers():
     if not session.get('logged_in'): return jsonify({'error': '401'}), 401
     with open(SERVERS_FILE, 'r') as f:
         servers = json.load(f)
     
-    # 简单的连通性检测
     check_status = request.args.get('check')
     if check_status == 'true':
         for s in servers:
@@ -141,7 +135,6 @@ def list_servers():
             
     return jsonify(servers)
 
-# API: 添加服务器
 @app.route('/api/servers/add', methods=['POST'])
 def add_server():
     if not session.get('logged_in'): return jsonify({'error': '401'}), 401
@@ -162,7 +155,6 @@ def add_server():
         json.dump(servers, f, indent=4)
     return jsonify({'success': True})
 
-# API: 删除服务器
 @app.route('/api/servers/delete/<int:sid>', methods=['POST'])
 def delete_server(sid):
     if not session.get('logged_in'): return jsonify({'error': '401'}), 401
@@ -188,7 +180,7 @@ def remote_status(sid):
     server = get_server_by_id(sid)
     if not server: return jsonify({'error': 'Not found'}), 404
 
-    # 1. 检查是否安装
+    # 检查是否安装
     check_cmd = "test -f /usr/local/bin/ehco && echo 'yes' || echo 'no'"
     out, err = run_remote_command(server, check_cmd)
     if err: return jsonify({'success': False, 'message': f"连接失败: {err}"})
@@ -198,12 +190,12 @@ def remote_status(sid):
     config_data = []
 
     if is_installed:
-        # 2. 检查运行状态
+        # 检查运行状态 (兼容 active 和 activating)
         run_cmd = "systemctl is-active ehco"
         out_run, _ = run_remote_command(server, run_cmd)
         is_running = (out_run == 'active' or out_run == 'activating')
 
-        # 3. 读取配置
+        # 读取配置
         cat_cmd = "cat /etc/ehco/config.json"
         out_conf, _ = run_remote_command(server, cat_cmd)
         try:
@@ -230,20 +222,52 @@ def remote_install(sid):
     
     # 1. 检测架构
     arch_out, _ = run_remote_command(server, "uname -m")
-    if arch_out == 'x86_64': filename = "ehco_linux_amd64"
-    elif arch_out == 'aarch64': filename = "ehco_linux_arm64"
-    else: return jsonify({'success': False, 'message': '不支持的架构'})
+    if arch_out == 'x86_64': 
+        filename = "ehco_linux_amd64"
+    elif arch_out == 'aarch64': 
+        filename = "ehco_linux_arm64"
+    else: 
+        return jsonify({'success': False, 'message': f'不支持的架构: {arch_out}'})
 
-    download_url = f"{DOWNLOAD_URL_BASE}/{filename}"
+    # 官方源和镜像源
+    official_url = f"https://github.com/Ehco1996/ehco/releases/download/{EHCO_TAG}/{filename}"
+    mirror_url = f"https://mirror.ghproxy.com/{official_url}"
     
-    # 2. 组合安装命令
+    # 2. 组合安装命令 (双保险下载 + 文件校验 + 服务保活)
     install_script = f"""
     apt update && apt install -y wget jq ca-certificates
-    wget -O /usr/local/bin/ehco {download_url}
+    
+    # 停止旧服务
+    systemctl stop ehco 2>/dev/null
+    rm -f /usr/local/bin/ehco
+
+    echo "Downloading from Mirror..."
+    wget -T 15 -t 2 -O /usr/local/bin/ehco {mirror_url}
+    
+    if [ ! -s /usr/local/bin/ehco ]; then
+        echo "Mirror failed, trying Official..."
+        wget -T 30 -t 3 -O /usr/local/bin/ehco {official_url}
+    fi
+
+    if [ ! -s /usr/local/bin/ehco ]; then
+        echo "FATAL: Download failed from both sources."
+        exit 1
+    fi
+    
     chmod +x /usr/local/bin/ehco
+    
+    # === 关键步骤：验证文件是否损坏 (避免 Exec format error) ===
+    if ! /usr/local/bin/ehco -h > /dev/null 2>&1; then
+        echo "FATAL: Downloaded file is corrupted (HTML or Wrong Arch)."
+        rm -f /usr/local/bin/ehco
+        exit 1
+    fi
+    
     mkdir -p /etc/ehco
+    # 写入初始空配置
     echo '{{"relay_rules": []}}' > /etc/ehco/config.json
     
+    # 写入 Systemd 服务 (Restart=always 保活)
     echo '[Unit]
 Description=Ehco Service
 After=network.target network-online.target
@@ -266,6 +290,10 @@ WantedBy=multi-user.target' > /etc/systemd/system/ehco.service
     """
     
     out, err = run_remote_command(server, install_script)
+    
+    if "FATAL" in out:
+         return jsonify({'success': False, 'message': f"安装失败: 文件损坏或下载失败。请检查被控机网络。{out}"})
+         
     if "error" in err.lower() and "apt" not in err.lower(): 
          return jsonify({'success': False, 'message': err})
          
@@ -287,7 +315,7 @@ def remote_save_rules(sid):
     new_config = {"relay_rules": data.get('rules', [])}
     json_str = json.dumps(new_config, indent=4)
     
-    # 通过 echo 写入远程文件
+    # 写入配置并重启 (使用 echo 防止 EOF 冲突)
     json_str_safe = json_str.replace("'", "'\"'\"'")
     cmd = f"echo '{json_str_safe}' > /etc/ehco/config.json && systemctl restart ehco"
     
@@ -627,6 +655,7 @@ cat > "$APP_DIR/templates/manage.html" <<EOF
             tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted">暂无配置</td></tr>';
             return;
         }
+        // 渲染表格，增加删除按钮
         rules.forEach((r, index) => {
             tbody.innerHTML += \`<tr>
                 <td>\${r.listen}</td>
@@ -638,6 +667,7 @@ cat > "$APP_DIR/templates/manage.html" <<EOF
         });
     }
 
+    // 单条删除功能
     async function deleteRule(index) {
         if(!confirm('确认删除此规则?')) return;
         currentConfig.splice(index, 1);
@@ -648,7 +678,7 @@ cat > "$APP_DIR/templates/manage.html" <<EOF
         if(!confirm('将在远程服务器执行安装脚本，确认?')) return;
         const res = await fetch('/api/remote/install/' + SID, {method: 'POST'});
         const d = await res.json();
-        if(d.success) { alert('安装指令已发送，请稍等片刻刷新页面'); setTimeout(refreshRemote, 3000); }
+        if(d.success) { alert('安装指令已发送，请稍等片刻刷新页面'); setTimeout(refreshRemote, 5000); }
         else alert('安装失败: ' + d.message);
     }
 
@@ -665,7 +695,7 @@ cat > "$APP_DIR/templates/manage.html" <<EOF
             body: JSON.stringify({rules: newRules})
         });
         if(res.ok) {
-            alert('规则已添加并重启服务');
+            alert('规则已保存并重启服务');
             refreshRemote();
         } else {
             alert('保存失败');
@@ -683,11 +713,12 @@ cat > "$APP_DIR/templates/manage.html" <<EOF
         const lport = fd.get('lport');
         const tip = fd.get('tip');
         const tport = fd.get('tport');
-        const ftype = fd.get('forward_type'); 
+        const ftype = fd.get('forward_type'); // 获取下拉框选择
 
         let newEntries = [];
 
         if (mode === 1) { // 不加密转发
+            // 逻辑更新：根据下拉框选择添加
             if (ftype === 'tcp' || ftype === 'both') {
                 newEntries.push({listen: ':'+lport, listen_type: 'tcp', remote: tip+':'+tport, remote_type: 'tcp'});
             }

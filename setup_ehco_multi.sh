@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Ehco 多服务器集群管理面板 - 安装脚本
+# Ehco 多服务器集群管理面板 - 一键安装脚本
 # ==========================================
 
 RED='\033[0;31m'
@@ -45,7 +45,7 @@ else
 fi
 
 # ==========================================
-# 生成后端 (app.py) - SSH 远程管理核心
+# 生成后端 (app.py) - 修复了 EOF 嵌套问题
 # ==========================================
 cat > "$APP_DIR/app.py" <<EOF
 import os
@@ -130,7 +130,7 @@ def list_servers():
     with open(SERVERS_FILE, 'r') as f:
         servers = json.load(f)
     
-    # 简单的连通性检测 (不阻塞太久，实际生产环境应异步)
+    # 简单的连通性检测
     check_status = request.args.get('check')
     if check_status == 'true':
         for s in servers:
@@ -237,6 +237,7 @@ def remote_install(sid):
     download_url = f"{DOWNLOAD_URL_BASE}/{filename}"
     
     # 2. 组合安装命令 (远程执行)
+    # 【修复重点】改用 echo 写入文件，彻底避免嵌套 Heredoc 导致的 Bash 错误
     install_script = f"""
     apt update && apt install -y wget jq
     wget -O /usr/local/bin/ehco {download_url}
@@ -244,8 +245,7 @@ def remote_install(sid):
     mkdir -p /etc/ehco
     echo '{{"relay_rules": []}}' > /etc/ehco/config.json
     
-    cat > /etc/systemd/system/ehco.service <<EOF
-[Unit]
+    echo '[Unit]
 Description=Ehco Service
 After=network.target
 [Service]
@@ -254,15 +254,15 @@ User=root
 ExecStart=/usr/local/bin/ehco -c /etc/ehco/config.json
 Restart=on-failure
 [Install]
-WantedBy=multi-user.target
-EOF
+WantedBy=multi-user.target' > /etc/systemd/system/ehco.service
+
     systemctl daemon-reload
     systemctl enable ehco
     systemctl start ehco
     """
     
     out, err = run_remote_command(server, install_script)
-    if "error" in err.lower() and "apt" not in err.lower(): # 忽略apt warning
+    if "error" in err.lower() and "apt" not in err.lower(): 
          return jsonify({'success': False, 'message': err})
          
     return jsonify({'success': True})
@@ -278,12 +278,12 @@ def remote_restart(sid):
 def remote_save_rules(sid):
     if not session.get('logged_in'): return jsonify({'error': '401'}), 401
     server = get_server_by_id(sid)
-    data = request.json # 这里接收的是新的完整 relay_rules 列表
+    data = request.json 
     
     new_config = {"relay_rules": data.get('rules', [])}
     json_str = json.dumps(new_config, indent=4)
     
-    # 通过 echo 写入远程文件 (注意转义单引号)
+    # 通过 echo 写入远程文件
     json_str_safe = json_str.replace("'", "'\"'\"'")
     cmd = f"echo '{json_str_safe}' > /etc/ehco/config.json && systemctl restart ehco"
     
